@@ -52,6 +52,7 @@ import com.mapbox.geojson.Point
 import com.mapbox.maps.CameraOptions
 import com.mapbox.maps.CoordinateBounds
 import com.mapbox.maps.EdgeInsets
+import com.mapbox.maps.coroutine.mapLoadedEvents
 import com.mapbox.maps.plugin.animation.MapAnimationOptions
 import com.mapbox.maps.plugin.animation.camera
 import com.mapbox.maps.plugin.locationcomponent.location
@@ -75,6 +76,8 @@ class MapFragment : Fragment(), BoolderMapListener {
             if (bottomSheetBehavior.state != STATE_HIDDEN) onTopoUnselected()
         }
     }
+
+    private var pendingMapAction: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -103,7 +106,6 @@ class MapFragment : Fragment(), BoolderMapListener {
 
                 updateMargins(bottom = bottomMargin + systemInsets.bottom + bottomNavHeight)
             }
-            binding.topoView.applyInsets(systemInsets)
 
             insets
         }
@@ -132,22 +134,26 @@ class MapFragment : Fragment(), BoolderMapListener {
         binding.mapView.apply {
             setup(this@MapFragment, layerFactory.buildStyle())
 
-            mapboxMap.subscribeMapLoaded {
-                val cameraOptions = mapViewModel.cameraState?.let { cameraState ->
-                    CameraOptions.Builder()
-                        .center(cameraState.center)
-                        .padding(cameraState.padding)
-                        .zoom(cameraState.zoom)
-                        .build()
-                } ?: CameraOptions.Builder()
-                    .center(Point.fromLngLat(2.5968216, 48.3925623))
-                    .zoom(10.2)
-                    .build()
+            mapboxMap.mapLoadedEvents.launchAndCollectIn(viewLifecycleOwner) {
+                pendingMapAction?.invoke()
+                    ?: run {
+                        val cameraOptions = mapViewModel.cameraState?.let { cameraState ->
+                            CameraOptions.Builder()
+                                .center(cameraState.center)
+                                .padding(cameraState.padding)
+                                .zoom(cameraState.zoom)
+                                .build()
+                        } ?: CameraOptions.Builder()
+                            .center(Point.fromLngLat(2.5968216, 48.3925623))
+                            .zoom(10.2)
+                            .build()
 
-                mapboxMap.setCamera(cameraOptions)
-                postDelayed(1_000L) { detectArea() }
+                        mapboxMap.setCamera(cameraOptions)
+                        postDelayed(1_000L) { detectArea() }
+                    }
 
                 mapViewModel.cameraState = null
+                pendingMapAction = null
             }
         }
 
@@ -156,14 +162,7 @@ class MapFragment : Fragment(), BoolderMapListener {
         }
 
         binding.topoView.apply {
-            onSelectProblemOnMap = { problemId ->
-                binding.mapView.selectProblem(problemId)
-                mapViewModel.updateCircuitControlsForProblem(problemId)
-            }
-            onCircuitProblemSelected = {
-                mapViewModel.fetchTopo(problemId = it, origin = TopoOrigin.CIRCUIT)
-            }
-            onShowProblemPhotoFullScreen = ::navigateToFullScreenProblemPhoto
+            topoCallbacks = mapViewModel
             tickedProblemSaver = mapViewModel
         }
 
@@ -205,10 +204,22 @@ class MapFragment : Fragment(), BoolderMapListener {
 
         mapViewModel.eventFlow.launchAndCollectIn(owner = viewLifecycleOwner) { event ->
             when (event) {
+                is MapViewModel.Event.SelectProblemOnMap -> binding.mapView.selectProblem(event.problemId.toString())
                 is MapViewModel.Event.ShowAvailableCircuits -> showCircuitFilterBottomSheet(event)
                 is MapViewModel.Event.ShowGradeRanges -> showGradesFilterBottomSheet(event)
+
+                is MapViewModel.Event.ShowProblemPhotoFullScreen -> navigateToFullScreenProblemPhoto(
+                    problemId = event.problemId,
+                    photoUri = event.photoUri
+                )
+
                 is MapViewModel.Event.ZoomOnCircuit -> zoomOnCircuit(event)
-                is MapViewModel.Event.ZoomOnCircuitStartProblem -> onProblemSelected(event.problemId, TopoOrigin.CIRCUIT)
+
+                is MapViewModel.Event.ZoomOnCircuitStartProblem -> onProblemSelected(
+                    problemId = event.problemId,
+                    origin = TopoOrigin.CIRCUIT
+                )
+
                 is MapViewModel.Event.ZoomOnArea -> flyToArea(event.area)
                 is MapViewModel.Event.WarnNoSavedProjects -> showNoSavedProjectsDialog()
                 is MapViewModel.Event.WarnNoTickedProblems -> showNoTickedProblemsDialog()
@@ -220,14 +231,16 @@ class MapFragment : Fragment(), BoolderMapListener {
             /* lifecycleOwner = */ this
         ) { _, bundle ->
             when {
-                bundle.containsKey("AREA") -> binding.root.postDelayed(500L) {
+                bundle.containsKey("AREA") -> pendingMapAction = {
                     flyToArea(requireNotNull(bundle.getParcelable("AREA")))
                 }
 
-                bundle.containsKey("PROBLEM") -> onProblemSelected(
-                    problemId = requireNotNull(bundle.getParcelable<Problem>("PROBLEM")).id,
-                    origin = TopoOrigin.SEARCH
-                )
+                bundle.containsKey("PROBLEM") -> pendingMapAction = {
+                    onProblemSelected(
+                        problemId = requireNotNull(bundle.getParcelable<Problem>("PROBLEM")).id,
+                        origin = TopoOrigin.SEARCH
+                    )
+                }
             }
         }
 
@@ -288,9 +301,7 @@ class MapFragment : Fragment(), BoolderMapListener {
 
     override fun onDestroyView() {
         binding?.topoView?.apply {
-            onSelectProblemOnMap = null
-            onCircuitProblemSelected = null
-            onShowProblemPhotoFullScreen = null
+            topoCallbacks = null
             tickedProblemSaver = null
         }
 
